@@ -1,0 +1,9 @@
+services:
+  dhapi:
+    image: ghcr.io/bob-park/dhapi-fastapi
+    build:
+      dockerfile: ./Dockerfile
+      x-bake:
+        platforms:
+          - linux/amd64
+          - linux/arm64
