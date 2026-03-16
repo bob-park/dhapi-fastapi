@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 import uvicorn
 import subprocess
 import json
@@ -82,6 +83,20 @@ def _normalize_buy_item(item: dict[str, Any]) -> dict[str, Any]:
         normalized["winnings"] = _parse_amount(str(normalized["winnings"]))
     if "text" in normalized and normalized["text"] is not None:
         normalized["text"] = _normalize_text(str(normalized["text"]))
+    if normalized.get("name") and "연금복" in str(normalized.get("name")) and "text" in normalized:
+        match = re.match(r"^\s*(\d+)\s*:\s*(\d+)\s*$", str(normalized.get("text", "")))
+        if match:
+            slot = match.group(1)
+            digits = [int(ch) for ch in match.group(2)] if match.group(2).isdigit() else []
+            normalized["numbers"] = [
+                {
+                    "slot": slot,
+                    "mode": "수동",
+                    "numbers": digits,
+                }
+            ]
+    if "text" in normalized:
+        del normalized["text"]
     return normalized
 
 
@@ -253,11 +268,17 @@ def show_balance():
 
 
 @app.post("/buy-lotto645")
-def buy_lotto645(
-    mode: str = Query("auto", alias="mode"),
-    count: int = Query(5, alias="count"),
-    numbers: Optional[str] = Query(None, alias="numbers"),
-):
+class BuyLottoRequest(BaseModel):
+    mode: str = "auto"
+    count: int = 5
+    numbers: Optional[str] = None
+
+
+@app.post("/buy-lotto645")
+def buy_lotto645(payload: BuyLottoRequest):
+    mode = payload.mode
+    count = payload.count
+    numbers = payload.numbers
     if mode not in {"auto", "manual"}:
         raise HTTPException(status_code=400, detail="mode must be 'auto' or 'manual'")
 
