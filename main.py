@@ -5,8 +5,51 @@ import subprocess
 import json
 import re
 from typing import Optional, Any
+import logging
+import os
 
 app = FastAPI()
+logger = logging.getLogger("dhapi")
+
+LOG_LEVEL_ENV = "DHAPI_LOG_LEVEL"
+DEFAULT_LOG_LEVEL = "DEBUG"
+LOG_LEVELS = {
+    "CRITICAL": logging.CRITICAL,
+    "ERROR": logging.ERROR,
+    "WARNING": logging.WARNING,
+    "INFO": logging.INFO,
+    "DEBUG": logging.DEBUG,
+    "NOTSET": logging.NOTSET,
+}
+
+
+def _configure_logging() -> None:
+    level_name = os.getenv(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL).strip().upper()
+    level = LOG_LEVELS.get(level_name)
+    if level is None:
+        level = LOG_LEVELS[DEFAULT_LOG_LEVEL]
+        logger.warning(
+            "Invalid %s=%s; falling back to %s",
+            LOG_LEVEL_ENV,
+            level_name,
+            DEFAULT_LOG_LEVEL,
+        )
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger.setLevel(level)
+
+
+def _truncate_for_log(value: str, limit: int = 4000) -> str:
+    if value is None:
+        return ""
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...<truncated {len(value) - limit} chars>"
+
+
+_configure_logging()
 
 
 @app.get("/")
@@ -15,6 +58,7 @@ def read_root():
 
 
 def run_dhapi(args: list[str]) -> dict:
+    logger.debug("Executing dhapi command: %s", ["dhapi", *args])
     try:
         result = subprocess.run(
             ["dhapi", *args],
@@ -24,6 +68,13 @@ def run_dhapi(args: list[str]) -> dict:
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail="dhapi command not found") from exc
+
+    logger.debug(
+        "dhapi command result: exit_code=%s stdout=%s stderr=%s",
+        result.returncode,
+        _truncate_for_log(result.stdout.strip()),
+        _truncate_for_log(result.stderr.strip()),
+    )
 
     payload = {
         "exit_code": result.returncode,
@@ -60,6 +111,35 @@ def _normalize_date(value: str) -> str | None:
 def _normalize_text(value: str) -> str:
     collapsed = re.sub(r"\s+", " ", value.replace("\n", " ")).strip()
     return collapsed
+
+
+def _parse_lotto645_numbers(stdout: str) -> list[dict[str, Any]]:
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    header_idx = next((i for i, ln in enumerate(lines) if "슬롯" in ln and ln.startswith("┃")), None)
+    if header_idx is None:
+        return []
+
+    numbers_list: list[dict[str, Any]] = []
+    for ln in lines[header_idx + 1 :]:
+        if ln.startswith("└") or ln.startswith("┡"):
+            continue
+        if not ln.startswith("│"):
+            break
+        parts = _split_table_row(ln)
+        if len(parts) < 8:
+            continue
+        slot = parts[0].strip()
+        mode = parts[1].strip()
+        nums = []
+        for val in parts[2:8]:
+            parsed = _parse_int(val)
+            if parsed is None:
+                nums = []
+                break
+            nums.append(parsed)
+        if slot and mode and nums:
+            numbers_list.append({"slot": slot, "mode": mode, "numbers": nums})
+    return numbers_list
 
 
 def _parse_int(value: Any) -> int | None:
@@ -267,7 +347,6 @@ def show_balance():
     return parse_balance_output(payload["stdout"])
 
 
-@app.post("/buy-lotto645")
 class BuyLottoRequest(BaseModel):
     mode: str = "auto"
     count: int = 5
@@ -291,9 +370,40 @@ def buy_lotto645(payload: BuyLottoRequest):
     else:
         if not numbers:
             raise HTTPException(status_code=400, detail="numbers is required for manual mode")
-        args.append(numbers)
 
-    payload = run_dhapi(args)
+        for _ in range(count):
+            args.append(numbers)
+
+    try:
+        payload = run_dhapi(args)
+    except HTTPException as exc:
+        detail = exc.detail
+        stdout = ""
+        stderr = ""
+        exit_code = None
+        if isinstance(detail, dict):
+            stdout = str(detail.get("stdout", "") or "")
+            stderr = str(detail.get("stderr", "") or "")
+            exit_code = detail.get("exit_code")
+        numbers_list = _parse_lotto645_numbers(stdout)
+        if numbers_list:
+            error_message = stderr.strip() or None
+            error_code = None
+            if error_message and ":" in error_message:
+                error_code = error_message.split(":", 1)[0].strip() or None
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={
+                    "numbers": numbers_list,
+                    "error": {
+                        "code": error_code,
+                        "message": error_message,
+                        "exit_code": exit_code,
+                    },
+                },
+            ) from exc
+        raise
+
     return {"message": payload["stdout"]}
 
 
